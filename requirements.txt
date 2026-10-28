@@ -2,3 +2,5 @@ feedparser>=6.0
 trafilatura>=1.12
 google-genai>=1.0
 googlenewsdecoder>=0.1.7
+xhtml2pdf>=0.2.16
+pypdf>=4.0
