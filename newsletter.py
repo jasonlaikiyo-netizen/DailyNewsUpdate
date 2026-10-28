@@ -34,8 +34,8 @@ PER_REGION_POOL = 40               # 每個區域最多送幾則標題給 AI 篩
 PICKS_PER_REGION = 3               # 每個區域最多入選幾則
 ARTICLE_CHARS = 3500               # 每篇全文最多送給 AI 多少字
 MODELS = [
-    os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-    "gemini-2.5-flash-lite",       # 主模型額度用完時的備援
+    os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
+    "gemini-3.5-flash-lite",       # 主模型不可用或額度用完時的備援
 ]
 UA = "Mozilla/5.0 (compatible; DailyNewsBot/1.0)"
 DOCS = Path(__file__).parent / "docs"
@@ -56,16 +56,6 @@ FEEDS = {
         ("報導者", gnews("site:twreporter.org")),
         ("公視新聞", gnews("site:news.pts.org.tw")),
     ],
-    "中國": [
-        ("澎湃", gnews("site:thepaper.cn")),
-        ("界面", gnews("site:jiemian.com")),
-        ("財新", gnews("site:caixin.com")),
-    ],
-    "香港": [
-        ("香港01", gnews("site:hk01.com")),
-        ("HKFP", gnews("site:hongkongfp.com")),
-        ("RTHK", gnews("site:news.rthk.hk")),
-    ],
     "國際": [
         ("BBC中文", "https://feeds.bbci.co.uk/zhongwen/trad/rss.xml"),
         ("DW中文", gnews("site:dw.com/zh")),
@@ -74,7 +64,7 @@ FEEDS = {
     ],
 }
 REGIONS = list(FEEDS.keys())
-REGION_COLORS = {"台灣": "#1f7a4d", "中國": "#b3261e", "香港": "#7b4fa3", "國際": "#1a5fb4"}
+REGION_COLORS = {"台灣": "#1f7a4d", "國際": "#1a5fb4"}
 
 client = genai.Client()  # 讀環境變數 GEMINI_API_KEY
 
@@ -89,10 +79,11 @@ def log(*a):
 
 
 def llm_json(prompt: str, retries: int = 4):
-    """呼叫 Gemini 並解析 JSON;失敗時重試、換備援模型。"""
+    """呼叫 Gemini 並解析 JSON;失敗時重試、換備援模型。模型不存在(404)就直接跳過該模型。"""
     last = None
+    models = list(MODELS)
     for attempt in range(retries):
-        for model in MODELS:
+        for model in list(models):
             try:
                 r = client.models.generate_content(
                     model=model,
@@ -107,7 +98,12 @@ def llm_json(prompt: str, retries: int = 4):
             except Exception as e:  # 額度、網路、JSON 格式錯誤都走這裡
                 last = e
                 log(f"[LLM] {model} 第 {attempt + 1} 次失敗:{type(e).__name__}: {str(e)[:160]}")
+                if "NOT_FOUND" in str(e) or "404" in str(e)[:40]:
+                    models.remove(model)  # 這個模型名稱不能用,不要再重試
+                    continue
                 time.sleep(6)
+        if not models:
+            break
         time.sleep(20 * (attempt + 1))
     raise RuntimeError(f"Gemini 多次失敗:{last}")
 
@@ -305,7 +301,7 @@ def render_html(date_str: str, sections: dict[str, list[dict]]) -> str:
 <body style="margin:0;background:#f0f2f5;font-family:-apple-system,'Noto Sans TC','PingFang TC','Microsoft JhengHei',sans-serif;color:#222;">
 <div style="max-width:680px;margin:0 auto;padding:24px 16px;">
   <h1 style="margin:0;font-size:24px;">每日焦點電子報</h1>
-  <p style="margin:4px 0 0;color:#666;">{e(date_str)} · 台灣 / 中國 / 香港 / 國際</p>
+  <p style="margin:4px 0 0;color:#666;">{e(date_str)} · 台灣 / 國際</p>
   {body}
   <p style="margin-top:32px;color:#999;font-size:12px;line-height:1.6;">
     本電子報由 AI 自動整理。事實摘要依據原文;「延伸趨勢」為 AI 推論,僅供參考,請以原始報導與後續事件為準。</p>
