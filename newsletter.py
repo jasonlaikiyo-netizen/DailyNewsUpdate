@@ -34,7 +34,7 @@ from xhtml2pdf import pisa
 
 # ───────────────────────── 設定區 ─────────────────────────
 TZ = timezone(timedelta(hours=8))  # 台灣時間
-HOURS = 36                         # 只看最近幾小時內的新聞
+HOURS = 30                         # 只看最近幾小時內的新聞(每天跑一次,30 小時足以涵蓋且重疊較少)
 PER_FEED = 25                      # 每個來源最多取幾則
 PER_REGION_POOL = 40               # 每個區域最多送幾則標題給 AI 篩選
 PICKS_PER_REGION = 3               # 每個區域最多入選幾則
@@ -45,6 +45,8 @@ MODELS = [
 ]
 UA = "Mozilla/5.0 (compatible; DailyNewsBot/1.0)"
 DOCS = Path(__file__).parent / "docs"
+HISTORY_FILE = DOCS / "sent.json"   # 已推播新聞紀錄(跨天去重用)
+HISTORY_DAYS = 5                    # 往前幾天內推播過的新聞不再重複
 
 
 def gnews(query: str) -> str:
@@ -143,6 +145,7 @@ def fetch_all() -> list[dict]:
                 pool.append({
                     "region": region,
                     "source": name,
+                    "orig_link": e.get("link", ""),
                     "title": title,
                     "summary": strip_tags(e.get("summary", ""))[:200],
                     "link": e.get("link", ""),
@@ -164,8 +167,51 @@ def check_feeds():
             print(f"{'OK ' if isinstance(n, int) and n else 'XX '} {region}/{name}: {n}")
 
 
+# ───────────────────────── 1b. 跨天去重 ─────────────────────────
+def load_history(today: str) -> list[dict]:
+    """讀取最近幾天已推播過的新聞。排除「今天」的紀錄,讓同一天重跑結果一致。"""
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
+    return [h for h in data if cutoff <= h.get("date", "") < today]
+
+
+def save_history(today: str, sections: dict) -> None:
+    try:
+        old = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        old = []
+    cutoff = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=14)).strftime("%Y-%m-%d")
+    keep = [h for h in old if h.get("date", "") != today and h.get("date", "") >= cutoff]
+    for cards in sections.values():
+        for c in cards:
+            keep.append({"date": today, "title": c["title"], "headline": c.get("headline", ""),
+                         "orig_link": c.get("orig_link", ""), "link": c.get("link", "")})
+    DOCS.mkdir(exist_ok=True)
+    HISTORY_FILE.write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def drop_seen(items: list[dict], history: list[dict]) -> list[dict]:
+    """移除近期已推播過的新聞:連結相同,或標題高度相似。"""
+    if not history:
+        return items
+    seen_links = {h.get(k) for h in history for k in ("orig_link", "link") if h.get(k)}
+    seen_titles = [t for h in history for t in (h.get("title"), h.get("headline")) if t]
+    kept = []
+    for it in items:
+        if it["orig_link"] in seen_links or any(
+                SequenceMatcher(None, it["title"], t).ratio() > 0.75 for t in seen_titles):
+            continue
+        kept.append(it)
+    log(f"[去重] 近 {HISTORY_DAYS} 天已推播過的新聞剔除 {len(items) - len(kept)} 則,剩 {len(kept)} 則")
+    return kept
+
+
 # ───────────────────────── 2. 階段一:篩選 ─────────────────────────
-def stage1_pick(items: list[dict]) -> list[dict]:
+def stage1_pick(items: list[dict], history: list[dict] | None = None) -> list[dict]:
+    prev = "\n".join(f"- {h['date']} {h.get('headline') or h['title']}" for h in (history or [])[-40:]) or "(無)"
     listing = "\n".join(
         f"{it['id']}|{it['region']}|{it['source']}|{it['title']}|{it['summary'][:100]}" for it in items
     )
@@ -185,6 +231,10 @@ def stage1_pick(items: list[dict]) -> list[dict]:
 
 若某區域沒有合格新聞,可以少選甚至不選,不要湊數。
 只輸出 JSON,格式:{{"picks":[{{"id":數字,"reason":"一句話理由"}}]}}
+
+【近幾天已推播過的新聞】
+同一事件不要再選;除非清單中的報導明確提供了重大新進展(新事實、新數據),才可以選入。
+{prev}
 
 新聞清單:
 {listing}"""
@@ -489,7 +539,12 @@ def main():
     if not items:
         sys.exit("沒有抓到任何新聞,請檢查 RSS 來源(python newsletter.py --check-feeds)")
 
-    picked = stage1_pick(items)
+    history = load_history(date_str)
+    items = drop_seen(items, history)
+    if not items:
+        sys.exit("扣除近期已推播過的新聞後,沒有新內容可選")
+
+    picked = stage1_pick(items, history)
     analyzed = stage2_analyze(picked) if picked else {}
 
     sections: dict[str, list[dict]] = {r: [] for r in REGIONS}
@@ -503,6 +558,7 @@ def main():
     DOCS.mkdir(exist_ok=True)
     (DOCS / f"{date_str}.html").write_text(page, encoding="utf-8")
     update_index()
+    save_history(date_str, sections)
     pdf_path = None
     try:  # PDF 失敗不影響寄信
         font, font_css = setup_pdf_font()
