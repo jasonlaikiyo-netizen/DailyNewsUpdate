@@ -1,0 +1,45 @@
+name: Daily Newsletter
+
+on:
+  schedule:
+    # cron 使用 UTC。13:00 UTC = 台灣時間 21:00(GitHub 排程可能延遲數分鐘到數十分鐘)
+    # 只收「當天」新聞,所以要排在晚上,內容才完整;別設太接近午夜,以免延遲後跨到隔天
+    - cron: "0 13 * * *"
+  workflow_dispatch:   # 可在 Actions 頁面手動觸發測試
+
+permissions:
+  contents: write      # 需要把存檔 commit 回 repo
+
+concurrency:
+  group: daily-newsletter
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate and send newsletter
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python newsletter.py
+
+      - name: Commit archive
+        run: |
+          git config user.name "newsletter-bot"
+          git config user.email "newsletter-bot@users.noreply.github.com"
+          git add docs
+          git diff --cached --quiet || (git commit -m "newsletter $(TZ=Asia/Taipei date +%F)" && git push)

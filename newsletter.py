@@ -34,7 +34,9 @@ from xhtml2pdf import pisa
 
 # ───────────────────────── 設定區 ─────────────────────────
 TZ = timezone(timedelta(hours=8))  # 台灣時間
-HOURS = 30                         # 只看最近幾小時內的新聞(每天跑一次,30 小時足以涵蓋且重疊較少)
+ONLY_TODAY = True                  # True:只收「台灣時間今天 00:00 之後」發布的新聞;False:改用下面的 HOURS
+HOURS = 30                         # ONLY_TODAY=False 時,只看最近幾小時內的新聞
+WINDOW_TEXT = "今天(台灣時間 00:00 之後)" if ONLY_TODAY else f"最近 {HOURS} 小時"
 PER_FEED = 25                      # 每個來源最多取幾則
 PER_REGION_POOL = 40               # 每個區域最多送幾則標題給 AI 篩選
 PICKS_PER_REGION = 3               # 每個區域最多入選幾則
@@ -82,6 +84,28 @@ def strip_tags(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(s or ""))).strip()
 
 
+def norm_title(t: str) -> str:
+    """標題正規化:去掉結尾的「 - 媒體名」與所有標點、空白,方便比對。"""
+    t = re.split(r"\s+[-|–—]\s+[^-|–—]{1,30}$", t or "")[0]
+    return re.sub(r"[\W_]+", "", t.lower())
+
+
+def similar_title(a: str, b: str) -> bool:
+    """兩個標題是否像是同一則新聞(整體相似度,或連續兩字詞的重疊度夠高)。"""
+    a, b = norm_title(a), norm_title(b)
+    if len(a) < 4 or len(b) < 4:
+        return False
+    if SequenceMatcher(None, a, b).ratio() > 0.7:
+        return True
+    ba = {a[i:i + 2] for i in range(len(a) - 1)}
+    bb = {b[i:i + 2] for i in range(len(b) - 1)}
+    return len(ba & bb) / max(1, len(ba | bb)) >= 0.5
+
+
+def prev_text(history) -> str:
+    return "\n".join(f"- {h['date']} {h.get('headline') or h['title']}" for h in (history or [])[-40:]) or "(無)"
+
+
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
@@ -118,10 +142,14 @@ def llm_json(prompt: str, retries: int = 4):
 
 # ───────────────────────── 1. 抓新聞 ─────────────────────────
 def fetch_all() -> list[dict]:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS)
+    if ONLY_TODAY:
+        cutoff = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=HOURS)
     items: list[dict] = []
+    seen_titles: list[str] = []   # 所有區域共用,避免同一事件在不同區域重複
     for region, sources in FEEDS.items():
-        pool, seen_titles = [], []
+        pool = []
         for name, url in sources:
             try:
                 feed = feedparser.parse(url, agent=UA)
@@ -133,13 +161,16 @@ def fetch_all() -> list[dict]:
                 continue
             for e in feed.entries[:PER_FEED]:
                 ts = e.get("published_parsed") or e.get("updated_parsed")
-                if ts and datetime(*ts[:6], tzinfo=timezone.utc) < cutoff:
-                    continue
+                if ts:
+                    if datetime(*ts[:6], tzinfo=timezone.utc) < cutoff:
+                        continue
+                elif ONLY_TODAY:
+                    continue  # 沒有發布時間就無法確認是今天的新聞,略過
                 title = strip_tags(e.get("title", ""))
                 if not title:
                     continue
                 # 去重:同區域內標題太像就略過(同一事件多家報導時保留先出現的)
-                if any(SequenceMatcher(None, title, t).ratio() > 0.8 for t in seen_titles):
+                if any(similar_title(title, t) for t in seen_titles):
                     continue
                 seen_titles.append(title)
                 pool.append({
@@ -194,15 +225,22 @@ def save_history(today: str, sections: dict) -> None:
 
 
 def drop_seen(items: list[dict], history: list[dict]) -> list[dict]:
-    """移除近期已推播過的新聞:連結相同,或標題高度相似。"""
+    """移除近期已推播過的新聞:連結相同,或標題像是同一則。"""
     if not history:
         return items
     seen_links = {h.get(k) for h in history for k in ("orig_link", "link") if h.get(k)}
     seen_titles = [t for h in history for t in (h.get("title"), h.get("headline")) if t]
-    kept = []
+    kept, shown = [], 0
     for it in items:
-        if it["orig_link"] in seen_links or any(
-                SequenceMatcher(None, it["title"], t).ratio() > 0.75 for t in seen_titles):
+        hit = None
+        if it["orig_link"] in seen_links:
+            hit = "同一連結"
+        else:
+            hit = next((t for t in seen_titles if similar_title(it["title"], t)), None)
+        if hit:
+            if shown < 15:
+                log(f"[去重] 剔除:{it['title'][:40]}  ≈  {hit[:40]}")
+                shown += 1
             continue
         kept.append(it)
     log(f"[去重] 近 {HISTORY_DAYS} 天已推播過的新聞剔除 {len(items) - len(kept)} 則,剩 {len(kept)} 則")
@@ -211,11 +249,11 @@ def drop_seen(items: list[dict], history: list[dict]) -> list[dict]:
 
 # ───────────────────────── 2. 階段一:篩選 ─────────────────────────
 def stage1_pick(items: list[dict], history: list[dict] | None = None) -> list[dict]:
-    prev = "\n".join(f"- {h['date']} {h.get('headline') or h['title']}" for h in (history or [])[-40:]) or "(無)"
+    prev = prev_text(history)
     listing = "\n".join(
         f"{it['id']}|{it['region']}|{it['source']}|{it['title']}|{it['summary'][:100]}" for it in items
     )
-    prompt = f"""你是嚴謹的國際新聞編輯。以下是最近 {HOURS} 小時的新聞清單,
+    prompt = f"""你是嚴謹的國際新聞編輯。以下是{WINDOW_TEXT}的新聞清單,
 格式為:id|區域|來源|標題|摘要
 
 任務:為「{'、'.join(REGIONS)}」各挑出最多 {PICKS_PER_REGION} 則最值得讀的新聞。
@@ -223,7 +261,7 @@ def stage1_pick(items: list[dict], history: list[dict] | None = None) -> list[di
 【必須排除】
 - 選舉、民調、選情、政黨或政治人物互相攻訐的口水戰
 - 名人八卦、純表態、口號式聲明、沒有新事實的評論或社論
-- 重複事件(同一事件只選資訊最完整的一則)
+- 重複事件(同一事件只選資訊最完整的一則;不同區域之間也不可重複選同一事件)
 
 【優先選擇】
 有具體事件、數據、政策或制度變動,且影響範圍大、帶來新資訊的新聞
@@ -246,6 +284,8 @@ def stage1_pick(items: list[dict], history: list[dict] | None = None) -> list[di
         it = by_id.get(p.get("id"))
         if not it or count[it["region"]] >= PICKS_PER_REGION:
             continue
+        if any(similar_title(it["title"], x["title"]) for x in picked):
+            continue  # AI 偶爾會選到同一事件的兩則
         count[it["region"]] += 1
         picked.append(it)
     log(f"[篩選] 入選 {len(picked)} 則:{count}")
@@ -278,10 +318,17 @@ def get_fulltext(it: dict) -> str:
 
 
 # ───────────────────────── 4. 階段二:摘要 + 趨勢 ─────────────────────────
-def stage2_analyze(picked: list[dict]) -> dict[int, dict]:
+def stage2_analyze(picked: list[dict], history: list[dict] | None = None) -> dict[int, dict]:
     blocks = []
+    prev = prev_text(history)
+    seen_links = {h.get(k) for h in (history or []) for k in ("orig_link", "link") if h.get(k)}
+    used_links: set = set()
     for it in picked:
-        text = get_fulltext(it)
+        text = get_fulltext(it)  # 這一步會把 Google News 轉址還原成原文網址
+        if it["link"] in seen_links or it["link"] in used_links:
+            log(f"[去重] 原文網址已推播過,略過:{it['title'][:40]}")
+            continue
+        used_links.add(it["link"])
         it["basis"] = "全文" if text else "僅標題與摘要"
         body = text or f"(無法取得全文,只有標題與摘要)\n摘要:{it['summary']}"
         blocks.append(f"### id={it['id']}|{it['region']}|{it['source']}\n標題:{it['title']}\n{body}")
@@ -295,6 +342,11 @@ def stage2_analyze(picked: list[dict]) -> dict[int, dict]:
 2. 「延伸趨勢」屬於推論,必須寫出推論依據;不確定時給出 2 種可能情境,不要只給單一預測。
 3. 若該篇只有標題與摘要(無全文),趨勢要更保守,並在 caveat 欄位註明資訊有限。
 4. 若讀完發現其實屬於選舉、民調、口水戰或空泛內容,將 skip 設為 true。
+5. 若某篇與【近幾天已推播過的新聞】是同一事件且沒有重大新進展,或與本批次另一篇是同一事件
+   (保留資訊較完整的一篇,其餘 skip),也將 skip 設為 true。
+
+【近幾天已推播過的新聞】
+{prev}
 
 每篇輸出欄位:
 - id:數字(照原樣)
@@ -545,14 +597,21 @@ def main():
         sys.exit("扣除近期已推播過的新聞後,沒有新內容可選")
 
     picked = stage1_pick(items, history)
-    analyzed = stage2_analyze(picked) if picked else {}
+    analyzed = stage2_analyze(picked, history) if picked else {}
 
     sections: dict[str, list[dict]] = {r: [] for r in REGIONS}
+    accepted: list[dict] = []
     for it in picked:
         a = analyzed.get(it["id"])
         if not a or a.get("skip"):
             continue
-        sections[it["region"]].append({**it, **a})
+        card = {**it, **a}
+        if any(card["link"] == c["link"] or similar_title(card["title"], c["title"])
+               or similar_title(card.get("headline", ""), c.get("headline", "")) for c in accepted):
+            log(f"[去重] 本期內重複,略過:{card['title'][:40]}")
+            continue
+        accepted.append(card)
+        sections[it["region"]].append(card)
 
     page = render_html(date_str, sections)
     DOCS.mkdir(exist_ok=True)
